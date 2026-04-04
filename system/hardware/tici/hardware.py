@@ -544,21 +544,62 @@ class Tici(HardwareBase):
 
     return r
 
-  def get_modem_data_usage(self):
+  def get_device_data_usage(self, ifname: str) -> tuple[int, int]:
     try:
-      wwan = self.get_wwan()
+      dev_path = self.nm.GetDeviceByIpIface(ifname, dbus_interface=NM, timeout=TIMEOUT)
+      dev = self.bus.get_object(NM, dev_path)
 
       # Ensure refresh rate is set so values don't go stale
-      refresh_rate = wwan.Get(NM_DEV_STATS, 'RefreshRateMs', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
+      refresh_rate = dev.Get(NM_DEV_STATS, 'RefreshRateMs', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
       if refresh_rate != REFRESH_RATE_MS:
         u = type(refresh_rate)
-        wwan.Set(NM_DEV_STATS, 'RefreshRateMs', u(REFRESH_RATE_MS), dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
+        dev.Set(NM_DEV_STATS, 'RefreshRateMs', u(REFRESH_RATE_MS), dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
 
-      tx = wwan.Get(NM_DEV_STATS, 'TxBytes', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
-      rx = wwan.Get(NM_DEV_STATS, 'RxBytes', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
+      tx = dev.Get(NM_DEV_STATS, 'TxBytes', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
+      rx = dev.Get(NM_DEV_STATS, 'RxBytes', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
       return int(tx), int(rx)
     except Exception:
       return -1, -1
+
+  def get_modem_data_usage(self):
+    return self.get_device_data_usage('wwan0')
+
+  def get_network_diagnostics(self, network_type):
+    diag = {
+      'wlanTx': -1,
+      'wlanRx': -1,
+      'wwanTx': -1,
+      'wwanRx': -1,
+      'wifiState': -1,
+      'wifiStateReason': -1,
+      'wifiSsid': None,
+      'wifiBssid': None,
+      'wifiFrequency': 0,
+      'wifiStrength': -1,
+    }
+
+    try:
+      wlan = self.get_wlan()
+      diag['wlanTx'], diag['wlanRx'] = self.get_device_data_usage('wlan0')
+      diag['wifiState'] = int(wlan.Get(NM_DEV, 'State', dbus_interface=DBUS_PROPS, timeout=TIMEOUT))
+
+      state_reason = wlan.Get(NM_DEV, 'StateReason', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
+      if len(state_reason) > 1:
+        diag['wifiStateReason'] = int(state_reason[1])
+
+      if network_type == NetworkType.wifi:
+        active_ap_path = wlan.Get(NM_DEV_WL, 'ActiveAccessPoint', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
+        if active_ap_path != "/":
+          active_ap = self.bus.get_object(NM, active_ap_path)
+          ssid = bytes(active_ap.Get(NM_AP, 'Ssid', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)).decode("utf-8", "replace")
+          diag['wifiSsid'] = ssid
+          diag['wifiBssid'] = str(active_ap.Get(NM_AP, 'HwAddress', dbus_interface=DBUS_PROPS, timeout=TIMEOUT))
+          diag['wifiFrequency'] = int(active_ap.Get(NM_AP, 'Frequency', dbus_interface=DBUS_PROPS, timeout=TIMEOUT))
+          diag['wifiStrength'] = int(active_ap.Get(NM_AP, 'Strength', dbus_interface=DBUS_PROPS, timeout=TIMEOUT))
+    except Exception:
+      pass
+
+    return diag
 
   def has_internal_panda(self):
     return True

@@ -18,6 +18,7 @@ import time
 
 from jsonrpc import dispatcher
 from functools import partial
+from openpilot.common.diag import kmsg_log, mono_time_ns
 from openpilot.common.params import Params
 from openpilot.common.realtime import set_core_affinity
 from openpilot.common.swaglog import cloudlog
@@ -343,7 +344,10 @@ def main(exit_event: threading.Event | None = None):
       if conn_start is None:
         conn_start = time.monotonic()
 
-      cloudlog.event("sunnylinkd.main.connecting_ws", ws_uri=ws_uri, retries=conn_retries)
+      mono_ns = mono_time_ns()
+      cloudlog.event("sunnylinkd.main.connecting_ws", ws_uri=ws_uri, retries=conn_retries,
+                     mono_ns=mono_ns)
+      kmsg_log("sunnylinkd", "ws_connecting", mono_ns=mono_ns, retries=conn_retries)
       ws = create_connection(
         ws_uri,
         header={"Authorization": f"Bearer {sunnylink_api.get_token()}"},
@@ -351,19 +355,27 @@ def main(exit_event: threading.Event | None = None):
         sslopt={"cert_reqs": ssl.CERT_NONE if "localhost" in ws_uri else ssl.CERT_REQUIRED},
         timeout=SUNNYLINK_RECONNECT_TIMEOUT_S,
       )
+      mono_ns = mono_time_ns()
       cloudlog.event("sunnylinkd.main.connected_ws", ws_uri=ws_uri, retries=conn_retries,
-                     duration=time.monotonic() - conn_start)
+                     duration=time.monotonic() - conn_start, mono_ns=mono_ns)
+      kmsg_log("sunnylinkd", "ws_connected", mono_ns=mono_ns, retries=conn_retries,
+               duration=time.monotonic() - conn_start)
       conn_start = None
 
       conn_retries = 0
       cur_upload_items.clear()
 
       handle_long_poll(ws, exit_event)
+      mono_ns = mono_time_ns()
+      cloudlog.event("sunnylinkd.main.long_poll_ended", retries=conn_retries, mono_ns=mono_ns)
+      kmsg_log("sunnylinkd", "ws_poll_end", mono_ns=mono_ns, retries=conn_retries)
     except (KeyboardInterrupt, SystemExit):
       break
     except Exception as e:
       conn_retries += 1
       params.remove("LastSunnylinkPingTime")
+      kmsg_log("sunnylinkd", "ws_error", mono_ns=mono_time_ns(), retries=conn_retries,
+               error=type(e).__name__, level=4)
 
       if isinstance(e, (ConnectionError, TimeoutError, WebSocketException)):
         cloudlog.warning(f"sunnylinkd.main.{type(e).__name__}")

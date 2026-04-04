@@ -11,6 +11,7 @@ from collections.abc import Iterator
 
 from cereal import log
 import cereal.messaging as messaging
+from openpilot.common.diag import kmsg_log, mono_time_ns
 from openpilot.common.api import Api
 from openpilot.common.utils import get_upload_stream
 from openpilot.common.params import Params
@@ -169,13 +170,17 @@ class Uploader:
       cloudlog.exception("upload: getsize failed")
       return False
 
-    cloudlog.event("upload_start", key=key, fn=fn, sz=sz, network_type=network_type, metered=metered)
+    mono_ns = mono_time_ns()
+    cloudlog.event("upload_start", key=key, fn=fn, sz=sz, network_type=network_type,
+                   metered=metered, mono_ns=mono_ns)
+    kmsg_log("uploader", "upload_start", mono_ns=mono_ns, key=key, fn=fn,
+             sz=sz, network_type=network_type, metered=metered)
 
     if sz == 0:
       # tag files of 0 size as uploaded
       success = True
     elif name in MAX_UPLOAD_SIZES and sz > MAX_UPLOAD_SIZES[name]:
-      cloudlog.event("uploader_too_large", key=key, fn=fn, sz=sz)
+      cloudlog.event("uploader_too_large", key=key, fn=fn, sz=sz, mono_ns=mono_time_ns())
       success = True
     else:
       start_time = time.monotonic()
@@ -191,23 +196,37 @@ class Uploader:
         self.last_filename = fn
         dt = time.monotonic() - start_time
         if stat.status_code == 412:
-          cloudlog.event("upload_ignored", key=key, fn=fn, sz=sz, network_type=network_type, metered=metered)
+          mono_ns = mono_time_ns()
+          cloudlog.event("upload_ignored", key=key, fn=fn, sz=sz, network_type=network_type,
+                         metered=metered, mono_ns=mono_ns)
+          kmsg_log("uploader", "upload_ignored", mono_ns=mono_ns, key=key, fn=fn,
+                   sz=sz, network_type=network_type, metered=metered)
         else:
           content_length = int(stat.request.headers.get("Content-Length", 0))
           speed = (content_length / 1e6) / dt
+          mono_ns = mono_time_ns()
           cloudlog.event("upload_success", key=key, fn=fn, sz=sz, content_length=content_length,
-                         network_type=network_type, metered=metered, speed=speed)
+                         network_type=network_type, metered=metered, speed=speed,
+                         mono_ns=mono_ns)
+          kmsg_log("uploader", "upload_success", mono_ns=mono_ns, key=key, fn=fn,
+                   sz=sz, content_length=content_length, network_type=network_type,
+                   metered=metered, speed=speed)
         success = True
       else:
         success = False
-        cloudlog.event("upload_failed", stat=stat, exc=last_exc, key=key, fn=fn, sz=sz, network_type=network_type, metered=metered)
+        mono_ns = mono_time_ns()
+        cloudlog.event("upload_failed", stat=stat, exc=last_exc, key=key, fn=fn, sz=sz,
+                       network_type=network_type, metered=metered, mono_ns=mono_ns)
+        kmsg_log("uploader", "upload_failed", mono_ns=mono_ns, key=key, fn=fn,
+                 sz=sz, network_type=network_type, metered=metered, level=4)
 
     if success:
       # tag file as uploaded
       try:
         setxattr(fn, UPLOAD_ATTR_NAME, UPLOAD_ATTR_VALUE)
       except OSError:
-        cloudlog.event("uploader_setxattr_failed", exc=last_exc, key=key, fn=fn, sz=sz)
+        cloudlog.event("uploader_setxattr_failed", exc=last_exc, key=key, fn=fn, sz=sz,
+                       mono_ns=mono_time_ns())
 
     return success
 

@@ -31,6 +31,7 @@ from websocket import (ABNF, WebSocket, WebSocketException, WebSocketTimeoutExce
 import cereal.messaging as messaging
 from cereal import log
 from cereal.services import SERVICE_LIST
+from openpilot.common.diag import kmsg_log, mono_time_ns
 from openpilot.common.api import Api, get_key_pair
 from openpilot.common.utils import CallbackReader, get_upload_stream
 from openpilot.common.params import Params
@@ -133,6 +134,10 @@ log_recv_queue: Queue[str] = queue.Queue()
 cancelled_uploads: set[str] = set()
 
 cur_upload_items: dict[int, UploadItem | None] = {}
+
+
+def upload_diag_counts() -> tuple[int, int]:
+  return upload_queue.qsize(), sum(item is not None for item in cur_upload_items.values())
 
 
 # TODO-SP: adapt zst for sunnylink
@@ -275,7 +280,7 @@ def upload_handler(end_event: threading.Event) -> None:
       # Remove item if too old
       age = datetime.now() - datetime.fromtimestamp(item.created_at / 1000)
       if age.total_seconds() > MAX_AGE:
-        cloudlog.event("athena.upload_handler.expired", item=item, error=True)
+        cloudlog.event("athena.upload_handler.expired", item=item, error=True, mono_ns=mono_time_ns())
         continue
 
       # Check if uploading over metered connection is allowed
@@ -292,22 +297,56 @@ def upload_handler(end_event: threading.Event) -> None:
           sz = os.path.getsize(fn)
         except OSError:
           sz = -1
-
-        cloudlog.event("athena.upload_handler.upload_start", fn=fn, sz=sz, network_type=network_type, metered=metered, retry_count=item.retry_count)
+        mono_ns = mono_time_ns()
+        queued, inflight = upload_diag_counts()
+        cloudlog.event("athena.upload_handler.upload_start", fn=fn, sz=sz, network_type=network_type,
+                       metered=metered, retry_count=item.retry_count, queued=queued,
+                       inflight=inflight, mono_ns=mono_ns)
+        kmsg_log("athenad", "upload_start", mono_ns=mono_ns, fn=fn, sz=sz,
+                 network_type=network_type, metered=metered,
+                 retry_count=item.retry_count, queued=queued, inflight=inflight)
 
         with _do_upload(item, partial(cb, sm, item, tid, end_event)) as response:
           if response.status_code not in (200, 201, 401, 403, 412):
-            cloudlog.event("athena.upload_handler.retry", status_code=response.status_code, fn=fn, sz=sz, network_type=network_type, metered=metered)
+            mono_ns = mono_time_ns()
+            queued, inflight = upload_diag_counts()
+            cloudlog.event("athena.upload_handler.retry", status_code=response.status_code, fn=fn, sz=sz,
+                           network_type=network_type, metered=metered, queued=queued,
+                           inflight=inflight, mono_ns=mono_ns)
+            kmsg_log("athenad", "upload_retry", mono_ns=mono_ns, fn=fn, sz=sz,
+                     network_type=network_type, metered=metered,
+                     status_code=response.status_code, queued=queued, inflight=inflight)
             retry_upload(tid, end_event)
           else:
-            cloudlog.event("athena.upload_handler.success", fn=fn, sz=sz, network_type=network_type, metered=metered)
+            mono_ns = mono_time_ns()
+            queued, inflight = upload_diag_counts()
+            cloudlog.event("athena.upload_handler.success", fn=fn, sz=sz, network_type=network_type,
+                           metered=metered, queued=queued, inflight=inflight,
+                           mono_ns=mono_ns)
+            kmsg_log("athenad", "upload_success", mono_ns=mono_ns, fn=fn, sz=sz,
+                     network_type=network_type, metered=metered,
+                     queued=queued, inflight=inflight)
 
         UploadQueueCache.cache(upload_queue)
       except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError):
-        cloudlog.event("athena.upload_handler.timeout", fn=fn, sz=sz, network_type=network_type, metered=metered)
+        mono_ns = mono_time_ns()
+        queued, inflight = upload_diag_counts()
+        cloudlog.event("athena.upload_handler.timeout", fn=fn, sz=sz, network_type=network_type,
+                       metered=metered, queued=queued, inflight=inflight,
+                       mono_ns=mono_ns)
+        kmsg_log("athenad", "upload_timeout", mono_ns=mono_ns, fn=fn, sz=sz,
+                 network_type=network_type, metered=metered,
+                 queued=queued, inflight=inflight, level=4)
         retry_upload(tid, end_event)
       except AbortTransferException:
-        cloudlog.event("athena.upload_handler.abort", fn=fn, sz=sz, network_type=network_type, metered=metered)
+        mono_ns = mono_time_ns()
+        queued, inflight = upload_diag_counts()
+        cloudlog.event("athena.upload_handler.abort", fn=fn, sz=sz, network_type=network_type,
+                       metered=metered, queued=queued, inflight=inflight,
+                       mono_ns=mono_ns)
+        kmsg_log("athenad", "upload_abort", mono_ns=mono_ns, fn=fn, sz=sz,
+                 network_type=network_type, metered=metered,
+                 queued=queued, inflight=inflight)
         retry_upload(tid, end_event, False)
 
     except queue.Empty:
@@ -921,27 +960,42 @@ def main(exit_event: threading.Event | None = None):
       if conn_start is None:
         conn_start = time.monotonic()
 
-      cloudlog.event("athenad.main.connecting_ws", ws_uri=ws_uri, retries=conn_retries)
+      mono_ns = mono_time_ns()
+      cloudlog.event("athenad.main.connecting_ws", ws_uri=ws_uri, retries=conn_retries,
+                     mono_ns=mono_ns)
+      kmsg_log("athenad", "ws_connecting", mono_ns=mono_ns, retries=conn_retries)
       ws = create_connection(ws_uri,
                              cookie="jwt=" + api.get_token(),
                              enable_multithread=True,
                              timeout=30.0)
+      mono_ns = mono_time_ns()
       cloudlog.event("athenad.main.connected_ws", ws_uri=ws_uri, retries=conn_retries,
-                     duration=time.monotonic() - conn_start)
+                     duration=time.monotonic() - conn_start, mono_ns=mono_ns)
+      kmsg_log("athenad", "ws_connected", mono_ns=mono_ns, retries=conn_retries,
+               duration=time.monotonic() - conn_start)
       conn_start = None
 
       conn_retries = 0
       cur_upload_items.clear()
 
       handle_long_poll(ws, exit_event)
+      mono_ns = mono_time_ns()
+      cloudlog.event("athenad.main.long_poll_ended", retries=conn_retries, mono_ns=mono_ns)
+      kmsg_log("athenad", "ws_poll_end", mono_ns=mono_ns, retries=conn_retries)
 
       ws.close()
     except (KeyboardInterrupt, SystemExit):
       break
     except (ConnectionError, TimeoutError, WebSocketException):
+      mono_ns = mono_time_ns()
+      kmsg_log("athenad", "ws_error", mono_ns=mono_ns, retries=conn_retries + 1,
+               error="WebSocketError", level=4)
       conn_retries += 1
       params.remove("LastAthenaPingTime")
     except Exception:
+      mono_ns = mono_time_ns()
+      kmsg_log("athenad", "ws_error", mono_ns=mono_ns, retries=conn_retries + 1,
+               error="Exception", level=4)
       cloudlog.exception("athenad.main.exception")
 
       conn_retries += 1

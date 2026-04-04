@@ -12,6 +12,7 @@ import psutil
 import cereal.messaging as messaging
 from cereal import log
 from cereal.services import SERVICE_LIST
+from openpilot.common.diag import kmsg_log, mono_time_ns
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -33,10 +34,11 @@ TEMP_TAU = 5.   # 5s time constant
 DISCONNECT_TIMEOUT = 5.  # wait 5 seconds before going offroad after disconnect so you get an alert
 PANDA_STATES_TIMEOUT = round(1000 / SERVICE_LIST['pandaStates'].frequency * 1.5)  # 1.5x the expected pandaState frequency
 ONROAD_CYCLE_TIME = 1  # seconds to wait offroad after requesting an onroad cycle
+NETWORK_DIAG_HEARTBEAT_NS = 30 * 1_000_000_000
 
 ThermalBand = namedtuple("ThermalBand", ['min_temp', 'max_temp'])
 HardwareState = namedtuple("HardwareState", ['network_type', 'network_info', 'network_strength', 'network_stats',
-                                             'network_metered', 'modem_temps'])
+                                             'network_metered', 'modem_temps', 'network_diag'])
 
 # List of thermal bands. We will stay within this region as long as we are within the bounds.
 # When exiting the bounds, we'll jump to the lower or higher band. Bands are ordered in the dict.
@@ -59,6 +61,51 @@ def set_offroad_alert_if_changed(offroad_alert: str, show_alert: bool, extra_tex
     return
   prev_offroad_states[offroad_alert] = (show_alert, extra_text)
   set_offroad_alert(offroad_alert, show_alert, extra_text)
+
+
+def _network_type_name(network_type: int) -> str:
+  try:
+    return NetworkType(network_type).name
+  except ValueError:
+    return str(network_type)
+
+
+def _network_diag_fields(hw_state: HardwareState) -> dict[str, int | str | bool | None]:
+  diag = hw_state.network_diag
+  return {
+    'network_type': _network_type_name(hw_state.network_type),
+    'metered': hw_state.network_metered,
+    'strength': int(hw_state.network_strength),
+    'wwan_tx': int(diag.get('wwanTx', -1)),
+    'wwan_rx': int(diag.get('wwanRx', -1)),
+    'wlan_tx': int(diag.get('wlanTx', -1)),
+    'wlan_rx': int(diag.get('wlanRx', -1)),
+    'wifi_state': int(diag.get('wifiState', -1)),
+    'wifi_reason': int(diag.get('wifiStateReason', -1)),
+    'wifi_ssid': diag.get('wifiSsid'),
+    'wifi_bssid': diag.get('wifiBssid'),
+    'wifi_freq': int(diag.get('wifiFrequency', 0)),
+    'wifi_signal': int(diag.get('wifiStrength', -1)),
+  }
+
+
+def _network_diag_changed(cur: dict[str, int | str | bool | None],
+                          prev: dict[str, int | str | bool | None] | None) -> bool:
+  if prev is None:
+    return True
+
+  keys = (
+    'network_type',
+    'metered',
+    'strength',
+    'wifi_state',
+    'wifi_reason',
+    'wifi_ssid',
+    'wifi_bssid',
+    'wifi_freq',
+    'wifi_signal',
+  )
+  return any(cur.get(key) != prev.get(key) for key in keys)
 
 def touch_thread(end_event):
   count = 0
@@ -119,7 +166,7 @@ def hw_state_thread(end_event, hw_queue):
           modem_version = HARDWARE.get_modem_version()
 
           if modem_version is not None:
-            cloudlog.event("modem version", version=modem_version)
+            cloudlog.event("modem version", version=modem_version, mono_ns=mono_time_ns())
 
         if AGNOS and modem_restart_count < 3 and HARDWARE.get_modem_version() is None:
           # TODO: we may be able to remove this with a MM update
@@ -130,10 +177,13 @@ def hw_state_thread(end_event, hw_queue):
           modem_missing_count += 1
           if (modem_missing_count % 4) == 0:
             modem_restart_count += 1
-            cloudlog.event("restarting ModemManager")
+            cloudlog.event("restarting ModemManager", mono_ns=mono_time_ns())
             os.system("sudo systemctl restart --no-block ModemManager")
 
         tx, rx = HARDWARE.get_modem_data_usage()
+        network_diag = HARDWARE.get_network_diagnostics(network_type)
+        network_diag['wwanTx'] = tx
+        network_diag['wwanRx'] = rx
 
         hw_state = HardwareState(
           network_type=network_type,
@@ -142,6 +192,7 @@ def hw_state_thread(end_event, hw_queue):
           network_stats={'wwanTx': tx, 'wwanRx': rx},
           network_metered=HARDWARE.get_network_metered(network_type),
           modem_temps=modem_temps,
+          network_diag=network_diag,
         )
 
         try:
@@ -189,7 +240,11 @@ def hardware_thread(end_event, hw_queue) -> None:
     network_strength=NetworkStrength.unknown,
     network_stats={'wwanTx': -1, 'wwanRx': -1},
     modem_temps=[],
+    network_diag={},
   )
+  prev_network_diag_fields: dict[str, int | str | bool | None] | None = None
+  last_network_heartbeat_ns = 0
+  last_network_heartbeat_fields: dict[str, int | str | bool | None] | None = None
 
   all_temp_filter = FirstOrderFilter(0., TEMP_TAU, DT_HW, initialized=False)
   offroad_temp_filter = FirstOrderFilter(0., TEMP_TAU, DT_HW, initialized=False)
@@ -264,6 +319,31 @@ def hardware_thread(end_event, hw_queue) -> None:
     msg.deviceState.networkStats = last_hw_state.network_stats
     if last_hw_state.network_info is not None:
       msg.deviceState.networkInfo = last_hw_state.network_info
+
+    network_diag_fields = _network_diag_fields(last_hw_state)
+    now_ns = mono_time_ns()
+    if _network_diag_changed(network_diag_fields, prev_network_diag_fields):
+      cloudlog.event("network_diag.state", mono_ns=now_ns, **network_diag_fields)
+      kmsg_log("netdiag", "state", mono_ns=now_ns, **network_diag_fields)
+      prev_network_diag_fields = network_diag_fields
+      last_network_heartbeat_fields = network_diag_fields
+      last_network_heartbeat_ns = now_ns
+    elif (last_hw_state.network_type == NetworkType.wifi and
+          now_ns - last_network_heartbeat_ns >= NETWORK_DIAG_HEARTBEAT_NS):
+      heartbeat_fields = dict(network_diag_fields)
+      if last_network_heartbeat_fields is not None:
+        heartbeat_fields['wlan_tx_delta'] = (
+          int(network_diag_fields['wlan_tx']) - int(last_network_heartbeat_fields['wlan_tx'])
+          if int(network_diag_fields['wlan_tx']) >= 0 and int(last_network_heartbeat_fields['wlan_tx']) >= 0 else -1
+        )
+        heartbeat_fields['wlan_rx_delta'] = (
+          int(network_diag_fields['wlan_rx']) - int(last_network_heartbeat_fields['wlan_rx'])
+          if int(network_diag_fields['wlan_rx']) >= 0 and int(last_network_heartbeat_fields['wlan_rx']) >= 0 else -1
+        )
+      cloudlog.event("network_diag.heartbeat", mono_ns=now_ns, **heartbeat_fields)
+      kmsg_log("netdiag", "heartbeat", mono_ns=now_ns, **heartbeat_fields)
+      last_network_heartbeat_fields = network_diag_fields
+      last_network_heartbeat_ns = now_ns
 
     msg.deviceState.modemTempC = last_hw_state.modem_temps
 
@@ -445,7 +525,7 @@ def hardware_thread(end_event, hw_queue) -> None:
         'location': (strip_deprecated_keys(sm["gpsLocationExternal"].to_dict()) if sm.alive["gpsLocationExternal"] else None),
         'deviceState': strip_deprecated_keys(msg.to_dict())
       }
-      cloudlog.event("STATUS_PACKET", **dat)
+      cloudlog.event("STATUS_PACKET", mono_ns=mono_time_ns(), **dat)
 
       # save last one before going onroad
       if rising_edge_started:
