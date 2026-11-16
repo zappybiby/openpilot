@@ -3,6 +3,7 @@ from openpilot.common.time_helpers import system_time_valid
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, BigToggle, BigParamControl, BigCircleParamControl, GreyBigButton
 from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog, BigInputDialog, BigConfirmationCircleButton
+from openpilot.selfdrive.ui.mici.widgets.lateral_accel_factor import LateralAccelFactorTile
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
@@ -90,6 +91,7 @@ class DeveloperLayoutMici(NavScroller):
                                               description="Show touch locations and the UI frame rate.")
 
     self._scroller.add_widgets([
+      LateralAccelFactorTile(ui_state),
       self._adb_toggle,
       self._ssh_toggle,
       self._ssh_keys_btn,
