@@ -146,6 +146,9 @@ def manager_thread() -> None:
       params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
     elif not started and started_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
+      # The prebuilt params library still has the old flags; clear these synchronously too.
+      for key in ("ControlsReady", "FirmwareQueryDone", "ObdMultiplexingChanged", "ObdMultiplexingEnabled"):
+        params.remove(key)
 
     ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
     if ignition and not ignition_prev:
