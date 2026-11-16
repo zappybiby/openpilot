@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 # Stock SUBARU_IMPREZA_2020 tune, which includes the 2020 Crosstrek.
 CROSSTREK_LAT_ACCEL_FACTOR = 2.6068223389108303
 TORQUE_SERVICE = "lateralTorqueParameters"
+DISPLAY_UPDATE_INTERVAL = 2.0
 VALUE_FONT_SIZE = 96
 
 
@@ -33,8 +34,7 @@ class LateralAccelFactorTile(Widget):
   def __init__(self, state: "UIState"):
     super().__init__()
     self._state = state
-    self._cached_factor: float | None = None
-    self._next_cache_read = 0.0
+    self._next_update = 0.0
     self.set_rect(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
     self._font = gui_app.font(FontWeight.BOLD)
     self._titles = [self._child(UnifiedLabel(text, font_size=28, alignment=TextAlignment.CENTER,
@@ -50,7 +50,7 @@ class LateralAccelFactorTile(Widget):
 
   def show_event(self):
     super().show_event()
-    self._next_cache_read = 0.0
+    self._next_update = 0.0
     self._update_state()
 
   def _read_cache(self) -> float | None:
@@ -65,18 +65,18 @@ class LateralAccelFactorTile(Widget):
     return None
 
   def _update_state(self):
+    now = time.monotonic()
+    if now < self._next_update:
+      return
+    self._next_update = now + DISPLAY_UPDATE_INTERVAL
+
     if self._state.started:
       sm = self._state.sm
       # A previous drive's last message remains in SubMaster across onroad cycles.
       current = sm.seen[TORQUE_SERVICE] and sm.alive[TORQUE_SERVICE] and sm.recv_frame[TORQUE_SERVICE] > self._state.started_frame
       self._set_value(sm[TORQUE_SERVICE].latAccelFactorFiltered if current else None)
-      self._next_cache_read = 0.0
     else:
-      now = time.monotonic()
-      if now >= self._next_cache_read:
-        self._cached_factor = self._read_cache()
-        self._next_cache_read = now + 1.0
-      self._set_value(self._cached_factor)
+      self._set_value(self._read_cache())
 
   def _render(self, rect):
     column_width = rect.width / 2
